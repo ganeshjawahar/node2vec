@@ -27,7 +27,6 @@ function Node2Vec:__init(config)
 	self.use_multi_label = config.use_multi_label
 	self.use_decay = config.use_decay
 	self.decay_rate = config.decay_rate
-	self.save_every = config.save_every
 	self.db = lmdb.env{Path = './'..self.pre..'_n2vDB', Name = self.pre..'_n2vDB'}
 	self.db:open(); self.db:close();
 
@@ -57,11 +56,10 @@ function Node2Vec:train()
 			self.m2_optim_state.learningRate = self.learning_rate
 			for i = 1, m2_size do
 				local data = reader:get('m2_'..indices[i])
-				self.m2_input = data
-				local _, loss = optim.rmsprop(self.m2_feval, self.m2_params, self.m2_optim_state)
+				self.m2_input, self.m2_label = {data[1], data[2]}, data[3]
+				local _, loss = optim.sgd(self.m2_feval, self.m2_params, self.m2_optim_state)
 				epoch_loss = epoch_loss + loss[1]
 				epoch_iteration = epoch_iteration + 1
-				data = nil
 				if epoch_iteration % 5 == 0 then
 					xlua.progress(epoch_iteration, m2_size)
 					collectgarbage()
@@ -73,7 +71,7 @@ function Node2Vec:train()
 			xlua.progress(m2_size, m2_size)
 			print(string.format("Done in %.2f minutes. Link-Info Loss = %f\n",((sys.clock() - m2_start) / 60), (epoch_loss / epoch_iteration)))
 		end
-		if epoch % self.save_every == 0 then
+		if epoch % 5 == 0 then
 			self:save_model(self.pre..epoch..'.t7')
 		end
 		--[[
@@ -111,23 +109,25 @@ function Node2Vec:create_batches()
 		end
 		local sample_idx = 0
 		print('creating batches for m2...')
-		local num_batches = torch.floor(self.edge_count / self.m2_batch_size)
-		local input = {}
+		local num_batches = torch.floor((self.edge_count + (self.m2_neg_samples * #self.id_2_node)) / self.m2_batch_size)
+		local input, input_context, label = {}, {}, torch.Tensor(self.m2_batch_size)
 		xlua.progress(1, num_batches)
 		for key, value in pairs(adj_list) do
 			samples = self:get_samples(key, adj_list[key])
 			for i, val in ipairs(samples) do
-				table.insert(input, val)
+				table.insert(input, val[1])
+				table.insert(input_context, val[2])
+				label[#input] = val[3]
 				if #input == self.m2_batch_size then
 					sample_idx = sample_idx + 1
-					writer:put('m2_'..sample_idx, input)
+					writer:put('m2_'..sample_idx, {input, input_context, label:cuda()})
 					if sample_idx % 50000 == 0 then
 						writer:commit()
 						writer = self.db:txn()
 						collectgarbage()
 					end
-					input = nil
-					input = {}
+					input, input_context = nil, nil
+					input, input_context = {}, {}
 					if sample_idx % 5 == 0 then
 						xlua.progress(sample_idx, num_batches)
 					end
@@ -137,12 +137,13 @@ function Node2Vec:create_batches()
 		if #input ~= 0 then
 			sample_idx = sample_idx + 1
 			local cur_size = #input
-			for j = cur_size + 1, self.m2_batch_size do
+			for j = cur_size + 1, self.m1_batch_size do
 				table.insert(input, input[1])
+				table.insert(input_context, input_context[1])
+				label[j] = label[1]
 			end
-			writer:put('m2_'..sample_idx, input)
-			input = nil
-			input = {}
+			writer:put('m2_'..sample_idx, {input, input_context, label:cuda()})
+			input, input_context, label = nil, nil, nil
 		end
 		xlua.progress(num_batches, num_batches)
 		writer:put('m2_size', sample_idx)
@@ -161,19 +162,20 @@ function Node2Vec:get_samples(node, neighbors)
 	local input = torch.IntTensor{node}
 	if self.gpu == 1 then input = input:cuda() end
 	for i, c in ipairs(neighbors) do
-		local context = torch.IntTensor(1 + self.m2_neg_samples)
+		local context = torch.IntTensor{c}
 		if self.gpu == 1 then context = context:cuda(); end
-		context[1] = c
-		-- generate negative samples
-		local i = 0
-		while i < self.m2_neg_samples do
-			neg_context = self.table[torch.random(self.table_size)]
-			if node ~= neg_context and neighbors[neg_context] == nil then
-				context[i + 2] = neg_context
-				i = i + 1
-			end
-		end	
-		table.insert(samples, {context, input})
+		table.insert(samples, {input, context, 1})
+	end
+	-- generate negative samples
+	local i = 0
+	while i < self.m2_neg_samples do
+		neg_context = self.table[torch.random(self.table_size)]
+		if node ~= neg_context and neighbors[neg_context] == nil then
+			local context = torch.IntTensor{neg_context}
+			if self.gpu == 1 then context = context:cuda(); end
+			table.insert(samples, {input, context, -1})	
+			i = i + 1
+		end
 	end
 	return samples
 end
@@ -182,41 +184,59 @@ function Node2Vec:create_model()
 	print('creating model...')
 	local start = sys.clock()
 	self.node_vecs = nn.LookupTable(#self.id_2_node, self.embed_size)
-	self.node_vecs:reset(self.params_init)
 	self.context_vecs = nn.LookupTable(#self.id_2_node, self.embed_size)
-	self.context_vecs:reset(self.params_init)
 
 	if self.use_link == 1 then
 		print('creating link model...')
 		self._link_model = nn.Sequential()
-		self._link_model:add(nn.ParallelTable())
-		self._link_model.modules[1]:add(self.context_vecs)
-		self._link_model.modules[1]:add(self.node_vecs)
-		self._link_model:add(nn.MM(false, true))
-		self._link_model:add(nn.Sigmoid())
-
-		self.link_model = nn.Sequential()
-		self.link_model:add(nn.ParallelTable())
-		xlua.progress(1, self.m2_batch_size)		
+		self._link_model:add(self.node_vecs:clone('weight', 'bias', 'gradWeight', 'gradBias'))
+		local layers = string.split(self.m2_layers, ',')
+		local input_size = self.embed_size
+		for i = 1, #layers do
+			self._link_model:add(nn.Linear(input_size, tonumber(layers[i])))
+			input_size = tonumber(layers[i])
+		end
+		self.__link_model = nn.Sequential()
+		self.__link_model:add(nn.ParallelTable())
+		xlua.progress(1, self.m2_batch_size)
 		for i = 1, self.m2_batch_size do
-			self.link_model.modules[1]:add(self._link_model:clone('weight', 'bias', 'gradWeight', 'gradBias'))
+			self.__link_model.modules[1]:add(self._link_model:clone('weight', 'bias', 'gradWeight', 'gradBias'))
 			if i % 10 == 0 then
 				xlua.progress(i, self.m2_batch_size)
 			end
 		end
 		xlua.progress(self.m2_batch_size, self.m2_batch_size)
-		self.link_model:add(nn.JoinTable(1))
+		self.__link_model:add(nn.JoinTable(1))
 
-		self.link_criterion = nn.BCECriterion()	
-		self.total_samples_per_batch = self.m2_batch_size * (self.m2_neg_samples + 1)
-		self.m2_label = torch.zeros(self.total_samples_per_batch)
-		for i = 1, self.total_samples_per_batch, (self.m2_neg_samples + 1) do
-			self.m2_label[i] = 1
+		self._link_context_model = nn.Sequential()
+		self._link_context_model:add(self.context_vecs:clone('weight', 'bias', 'gradWeight', 'gradBias'))
+		input_size = self.embed_size
+		for i = 1, #layers do
+			self._link_context_model:add(nn.Linear(input_size, tonumber(layers[i])))
+			input_size = tonumber(layers[i])
 		end
+		self.__link_context_model = nn.Sequential()
+		self.__link_context_model:add(nn.ParallelTable())
+		xlua.progress(1, self.m2_batch_size)
+		for i = 1, self.m2_batch_size do
+			self.__link_context_model.modules[1]:add(self._link_context_model:clone('weight', 'bias', 'gradWeight', 'gradBias'))
+			if i % 10 == 0 then
+				xlua.progress(i, self.m2_batch_size)
+			end
+		end
+		xlua.progress(self.m2_batch_size, self.m2_batch_size)
+		self.__link_context_model:add(nn.JoinTable(1))
+
+		self.link_model = nn.Sequential()
+		self.link_model:add(nn.ParallelTable())
+		self.link_model.modules[1]:add(self.__link_model)
+		self.link_model.modules[1]:add(self.__link_context_model)
+
+		self.link_criterion = nn.CosineEmbeddingCriterion(0.5)
+		self.link_criterion.sizeAverage = false
 		if self.gpu == 1 then 
 			self.link_model = self.link_model:cuda()
 			self.link_criterion = self.link_criterion:cuda()
-			self.m2_label = self.m2_label:cuda()
 		end
 
 		self.m2_optim_state = nil 
@@ -226,7 +246,8 @@ function Node2Vec:create_model()
 			self.m2_optim_state = {learningRate = self.learning_rate}
 		end
 		self.m2_params, self.m2_grad_params = self.link_model:getParameters()
-		self.m2_input = nil
+		self.m2_params:uniform(-1 * self.params_init, self.params_init)
+		self.m2_input, self.m2_label = nil, nil
 		self.m2_feval = function(z)
 			if z ~= self.m2_params then
 				self.m2_params:copy(z)
@@ -236,7 +257,7 @@ function Node2Vec:create_model()
 			local loss = self.link_criterion:forward(pred, self.m2_label)
 			local grads = self.link_criterion:backward(pred, self.m2_label)
 			self.link_model:backward(self.m2_input, grads)
-			-- self.m2_grad_params:div(self.m2_batch_size)
+			self.m2_grad_params:div(self.m2_batch_size)
 			loss = loss / self.m2_batch_size
 			if self.use_reg == 1 then
 				loss = loss + 0.5 * self.reg * self.m2_params:norm()^2
